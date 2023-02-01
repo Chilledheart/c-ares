@@ -409,11 +409,13 @@ static int file_lookup(struct host_query *hquery)
   FILE *fp;
   int error;
   int status;
-  const char *path_hosts = NULL;
+  char *path_hosts = NULL;
 
   if (hquery->hints.ai_flags & ARES_AI_ENVHOSTS)
     {
-      path_hosts = getenv("CARES_HOSTS");
+      path_hosts = ares_strdup(getenv("CARES_HOSTS"));
+      if (!path_hosts)
+        return ARES_ENOMEM;
     }
 
   if (!path_hosts)
@@ -447,15 +449,15 @@ static int file_lookup(struct host_query *hquery)
         return ARES_ENOTFOUND;
 
       strcat(PATH_HOSTS, WIN_PATH_HOSTS);
-      path_hosts = PATH_HOSTS;
-
 #elif defined(WATT32)
       const char *PATH_HOSTS = _w32_GetHostsFile();
 
       if (!PATH_HOSTS)
         return ARES_ENOTFOUND;
 #endif
-      path_hosts = PATH_HOSTS;
+      path_hosts = ares_strdup(PATH_HOSTS);
+      if (!path_hosts)
+        return ARES_ENOMEM;
     }
 
   fp = fopen(path_hosts, "r");
@@ -466,13 +468,19 @@ static int file_lookup(struct host_query *hquery)
         {
         case ENOENT:
         case ESRCH:
+          ares_free(path_hosts);
           return ARES_ENOTFOUND;
         default:
           DEBUGF(fprintf(stderr, "fopen() failed with error: %d %s\n", error,
                          strerror(error)));
           DEBUGF(fprintf(stderr, "Error opening file: %s\n", path_hosts));
+          ares_free(path_hosts);
           return ARES_EFILE;
         }
+    }
+  else
+    {
+      ares_free(path_hosts);
     }
   status = ares__readaddrinfo(fp, hquery->name, hquery->port, &hquery->hints, hquery->ai);
   fclose(fp);
