@@ -468,22 +468,22 @@ static int file_lookup(struct host_query *hquery)
         {
         case ENOENT:
         case ESRCH:
-          ares_free(path_hosts);
-          return ARES_ENOTFOUND;
+          status = ARES_ENOTFOUND;
+          break;
         default:
           DEBUGF(fprintf(stderr, "fopen() failed with error: %d %s\n", error,
                          strerror(error)));
           DEBUGF(fprintf(stderr, "Error opening file: %s\n", path_hosts));
-          ares_free(path_hosts);
-          return ARES_EFILE;
+          status = ARES_EFILE;
+          break;
         }
     }
   else
     {
-      ares_free(path_hosts);
+      status = ares__readaddrinfo(fp, hquery->name, hquery->port, &hquery->hints, hquery->ai);
+      fclose(fp);
     }
-  status = ares__readaddrinfo(fp, hquery->name, hquery->port, &hquery->hints, hquery->ai);
-  fclose(fp);
+  ares_free(path_hosts);
 
   /* RFC6761 section 6.3 #3 states that "Name resolution APIs and libraries
    * SHOULD recognize localhost names as special and SHOULD always return the
