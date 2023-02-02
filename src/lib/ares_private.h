@@ -434,4 +434,17 @@ int ares__connect_socket(ares_channel channel,
       (c)->sock_state_cb((c)->sock_state_cb_data, (s), (r), (w));       \
   } WHILE_FALSE
 
+
+#if defined(__has_feature)
+#  if __has_feature(memory_sanitizer)
+#    define MEMORY_SANITIZER 1
+#  endif
+#endif
+#if defined(MEMORY_SANITIZER)
+#include <sanitizer/msan_interface.h>
+#else
+#define __msan_unpoison(p, size)
+#define __msan_poison(p, size)
+#endif
+
 #endif /* __ARES_PRIVATE_H */

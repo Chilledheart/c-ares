@@ -116,6 +116,7 @@ int ares_init_options(ares_channel *channelptr, struct ares_options *options,
     *channelptr = NULL;
     return ARES_ENOMEM;
   }
+  memset(channel, 0, sizeof(*channel));
 
   now = ares__tvnow();
 
@@ -2543,6 +2544,7 @@ static int init_id_key(rc4_key* key,int key_data_len)
   if (!key_data_ptr)
     return ARES_ENOMEM;
   memset(key_data_ptr, 0, key_data_len);
+  __msan_unpoison(key_data_ptr, key_data_len);
 
   state = &key->state[0];
   for(counter = 0; counter < 256; counter++)

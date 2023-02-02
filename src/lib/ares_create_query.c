@@ -102,6 +102,7 @@ int ares_create_query(const char *name, int dnsclass, int type,
   buf = ares_malloc(len);
   if (!buf)
     return ARES_ENOMEM;
+  __msan_unpoison(buf, len);
 
   /* Set up the header. */
   q = buf;
