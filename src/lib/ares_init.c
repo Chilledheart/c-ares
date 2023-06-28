@@ -47,12 +47,9 @@
 #include <resolv.h>
 #endif
 
-#if defined(USE_WINSOCK)
-#  include <iphlpapi.h>
-#endif
-
 #include "ares.h"
 #include "ares_inet_net_pton.h"
+#include "ares_library_init.h"
 #include "ares_nowarn.h"
 #include "ares_platform.h"
 #include "ares_private.h"
@@ -61,6 +58,17 @@
 #undef WIN32  /* Redefined in MingW/MSVC headers */
 #endif
 
+/* Define RtlGenRandom = SystemFunction036.  This is in advapi32.dll.  There is
+ * no need to dynamically load this, other software used widely does not.
+ * http://blogs.msdn.com/michael_howard/archive/2005/01/14/353379.aspx
+ * https://docs.microsoft.com/en-us/windows/win32/api/ntsecapi/nf-ntsecapi-rtlgenrandom
+ */
+#ifdef _WIN32
+BOOLEAN WINAPI SystemFunction036(PVOID RandomBuffer, ULONG RandomBufferLength);
+#  ifndef RtlGenRandom
+#    define RtlGenRandom(a,b) SystemFunction036(a,b)
+#  endif
+#endif
 
 static int init_by_options(ares_channel channel,
                            const struct ares_options *options,
@@ -639,6 +647,227 @@ static int get_REG_SZ(HKEY hKey, const char *leafKeyName, char **outptr)
   return 1;
 }
 
+/*
+ * get_REG_SZ_9X()
+ *
+ * Functionally identical to get_REG_SZ()
+ *
+ * Supported on Windows 95, 98 and ME.
+ */
+static int get_REG_SZ_9X(HKEY hKey, const char *leafKeyName, char **outptr)
+{
+  DWORD dataType = 0;
+  DWORD size = 0;
+  int   res;
+
+  *outptr = NULL;
+
+  /* Find out size of string stored in registry */
+  res = RegQueryValueExA(hKey, leafKeyName, 0, &dataType, NULL, &size);
+  if ((res != ERROR_SUCCESS && res != ERROR_MORE_DATA) || !size)
+    return 0;
+
+  /* Allocate buffer of indicated size plus one given that string
+     might have been stored without null termination */
+  *outptr = ares_malloc(size+1);
+  if (!*outptr)
+    return 0;
+
+  /* Get the value for real */
+  res = RegQueryValueExA(hKey, leafKeyName, 0, &dataType,
+                        (unsigned char *)*outptr, &size);
+  if ((res != ERROR_SUCCESS) || (size == 1))
+  {
+    ares_free(*outptr);
+    *outptr = NULL;
+    return 0;
+  }
+
+  /* Null terminate buffer allways */
+  *(*outptr + size) = '\0';
+
+  return 1;
+}
+
+/*
+ * get_enum_REG_SZ()
+ *
+ * Given a 'hKeyParent' handle to an open registry key and a 'leafKeyName'
+ * pointer to the name of the registry leaf key to be queried, parent key
+ * is enumerated searching in child keys for given leaf key name and its
+ * associated string value. When located, this returns a pointer in *outptr
+ * to a newly allocated memory area holding it as a null-terminated string.
+ *
+ * Returns 0 and nullifies *outptr upon inability to return a string value.
+ *
+ * Returns 1 and sets *outptr when returning a dynamically allocated string.
+ *
+ * Supported on Windows NT 3.5 and newer.
+ */
+static int get_enum_REG_SZ(HKEY hKeyParent, const char *leafKeyName,
+                           char **outptr)
+{
+  char  enumKeyName[256];
+  DWORD enumKeyNameBuffSize;
+  DWORD enumKeyIdx = 0;
+  HKEY  hKeyEnum;
+  int   gotString;
+  int   res;
+
+  *outptr = NULL;
+
+  for(;;)
+  {
+    enumKeyNameBuffSize = sizeof(enumKeyName);
+    res = RegEnumKeyExA(hKeyParent, enumKeyIdx++, enumKeyName,
+                       &enumKeyNameBuffSize, 0, NULL, NULL, NULL);
+    if (res != ERROR_SUCCESS)
+      break;
+    res = RegOpenKeyExA(hKeyParent, enumKeyName, 0, KEY_QUERY_VALUE,
+                       &hKeyEnum);
+    if (res != ERROR_SUCCESS)
+      continue;
+    gotString = get_REG_SZ(hKeyEnum, leafKeyName, outptr);
+    RegCloseKey(hKeyEnum);
+    if (gotString)
+      break;
+  }
+
+  if (!*outptr)
+    return 0;
+
+  return 1;
+}
+
+/*
+ * get_DNS_Registry_9X()
+ *
+ * Functionally identical to get_DNS_Registry()
+ *
+ * Implementation supports Windows 95, 98 and ME.
+ */
+static int get_DNS_Registry_9X(char **outptr)
+{
+  HKEY hKey_VxD_MStcp;
+  int  gotString;
+  int  res;
+
+  *outptr = NULL;
+
+  res = RegOpenKeyExA(HKEY_LOCAL_MACHINE, WIN_NS_9X, 0, KEY_READ,
+                     &hKey_VxD_MStcp);
+  if (res != ERROR_SUCCESS)
+    return 0;
+
+  gotString = get_REG_SZ_9X(hKey_VxD_MStcp, NAMESERVER, outptr);
+  RegCloseKey(hKey_VxD_MStcp);
+
+  if (!gotString || !*outptr)
+    return 0;
+
+  return 1;
+}
+
+/*
+ * get_DNS_Registry_NT()
+ *
+ * Functionally identical to get_DNS_Registry()
+ *
+ * Refs: Microsoft Knowledge Base articles KB120642 and KB314053.
+ *
+ * Implementation supports Windows NT 3.5 and newer.
+ */
+static int get_DNS_Registry_NT(char **outptr)
+{
+  HKEY hKey_Interfaces = NULL;
+  HKEY hKey_Tcpip_Parameters;
+  int  gotString;
+  int  res;
+
+  *outptr = NULL;
+
+  res = RegOpenKeyExA(HKEY_LOCAL_MACHINE, WIN_NS_NT_KEY, 0, KEY_READ,
+                     &hKey_Tcpip_Parameters);
+  if (res != ERROR_SUCCESS)
+    return 0;
+
+  /*
+  ** Global DNS settings override adapter specific parameters when both
+  ** are set. Additionally static DNS settings override DHCP-configured
+  ** parameters when both are set.
+  */
+
+  /* Global DNS static parameters */
+  gotString = get_REG_SZ(hKey_Tcpip_Parameters, NAMESERVER, outptr);
+  if (gotString)
+    goto done;
+
+  /* Global DNS DHCP-configured parameters */
+  gotString = get_REG_SZ(hKey_Tcpip_Parameters, DHCPNAMESERVER, outptr);
+  if (gotString)
+    goto done;
+
+  /* Try adapter specific parameters */
+  res = RegOpenKeyExA(hKey_Tcpip_Parameters, "Interfaces", 0,
+                     KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS,
+                     &hKey_Interfaces);
+  if (res != ERROR_SUCCESS)
+  {
+    hKey_Interfaces = NULL;
+    goto done;
+  }
+
+  /* Adapter specific DNS static parameters */
+  gotString = get_enum_REG_SZ(hKey_Interfaces, NAMESERVER, outptr);
+  if (gotString)
+    goto done;
+
+  /* Adapter specific DNS DHCP-configured parameters */
+  gotString = get_enum_REG_SZ(hKey_Interfaces, DHCPNAMESERVER, outptr);
+
+done:
+  if (hKey_Interfaces)
+    RegCloseKey(hKey_Interfaces);
+
+  RegCloseKey(hKey_Tcpip_Parameters);
+
+  if (!gotString || !*outptr)
+    return 0;
+
+  return 1;
+}
+
+/*
+ * get_DNS_Registry()
+ *
+ * Locates DNS info in the registry. When located, this returns a pointer
+ * in *outptr to a newly allocated memory area holding a null-terminated
+ * string with a space or comma seperated list of DNS IP addresses.
+ *
+ * Returns 0 and nullifies *outptr upon inability to return DNSes string.
+ *
+ * Returns 1 and sets *outptr when returning a dynamically allocated string.
+ */
+static int get_DNS_Registry(char **outptr)
+{
+  win_platform platform;
+  int gotString = 0;
+
+  *outptr = NULL;
+
+  platform = ares__getplatform();
+
+  if (platform == WIN_NT)
+    gotString = get_DNS_Registry_NT(outptr);
+  else if (platform == WIN_9X)
+    gotString = get_DNS_Registry_9X(outptr);
+
+  if (!gotString)
+    return 0;
+
+  return 1;
+}
+
 static void commanjoin(char** dst, const char* const src, const size_t len)
 {
   char *newbuf;
@@ -667,6 +896,106 @@ static void commajoin(char **dst, const char *src)
   commanjoin(dst, src, strlen(src));
 }
 
+/*
+ * get_DNS_NetworkParams()
+ *
+ * Locates DNS info using GetNetworkParams() function from the Internet
+ * Protocol Helper (IP Helper) API. When located, this returns a pointer
+ * in *outptr to a newly allocated memory area holding a null-terminated
+ * string with a space or comma seperated list of DNS IP addresses.
+ *
+ * Returns 0 and nullifies *outptr upon inability to return DNSes string.
+ *
+ * Returns 1 and sets *outptr when returning a dynamically allocated string.
+ *
+ * Implementation supports Windows 98 and newer.
+ *
+ * Note: Ancient PSDK required in order to build a W98 target.
+ */
+static int get_DNS_NetworkParams(char **outptr)
+{
+  FIXED_INFO       *fi, *newfi;
+  struct ares_addr namesrvr;
+  char             *txtaddr;
+  IP_ADDR_STRING   *ipAddr;
+  int              res;
+  DWORD            size = sizeof (*fi);
+
+  *outptr = NULL;
+
+  /* Verify run-time availability of GetNetworkParams() */
+  if (ares_fpGetNetworkParams == ZERO_NULL)
+    return 0;
+
+  fi = ares_malloc(size);
+  if (!fi)
+    return 0;
+
+  res = (*ares_fpGetNetworkParams) (fi, &size);
+  if ((res != ERROR_BUFFER_OVERFLOW) && (res != ERROR_SUCCESS))
+    goto done;
+
+  newfi = ares_realloc(fi, size);
+  if (!newfi)
+    goto done;
+
+  fi = newfi;
+  res = (*ares_fpGetNetworkParams) (fi, &size);
+  if (res != ERROR_SUCCESS)
+    goto done;
+
+  for (ipAddr = &fi->DnsServerList; ipAddr; ipAddr = ipAddr->Next)
+  {
+    txtaddr = &ipAddr->IpAddress.String[0];
+
+    /* Validate converting textual address to binary format. */
+    if (ares_inet_pton(AF_INET, txtaddr, &namesrvr.addrV4) == 1)
+    {
+      if ((namesrvr.addrV4.S_un.S_addr == INADDR_ANY) ||
+          (namesrvr.addrV4.S_un.S_addr == INADDR_NONE))
+        continue;
+    }
+    else if (ares_inet_pton(AF_INET6, txtaddr, &namesrvr.addrV6) == 1)
+    {
+      if (memcmp(&namesrvr.addrV6, &ares_in6addr_any,
+                 sizeof(namesrvr.addrV6)) == 0)
+        continue;
+    }
+    else
+      continue;
+
+    commajoin(outptr, txtaddr);
+
+    if (!*outptr)
+      break;
+  }
+
+done:
+  if (fi)
+    ares_free(fi);
+
+  if (!*outptr)
+    return 0;
+
+  return 1;
+}
+
+static BOOL ares_IsWindowsVistaOrGreater(void)
+{
+  OSVERSIONINFO vinfo;
+  memset(&vinfo, 0, sizeof(vinfo));
+  vinfo.dwOSVersionInfoSize = sizeof(vinfo);
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4996) /* warning C4996: 'GetVersionExW': was declared deprecated */
+#endif
+  if (!GetVersionEx(&vinfo) || vinfo.dwMajorVersion < 6)
+    return FALSE;
+  return TRUE;
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+}
 
 /* A structure to hold the string form of IPv4 and IPv6 addresses so we can
  * sort them by a metric.
@@ -754,20 +1083,21 @@ static ULONG getBestRouteMetric(IF_LUID * const luid, /* Can't be const :( */
 #else
   MIB_IPFORWARD_ROW2 row;
   SOCKADDR_INET ignored;
-  if(GetBestRoute2(/* The interface to use.  The index is ignored since we are
-                    * passing a LUID.
-                    */
-                   luid, 0,
-                   /* No specific source address. */
-                   NULL,
-                   /* Our destination address. */
-                   dest,
-                   /* No options. */
-                   0,
-                   /* The route row. */
-                   &row,
-                   /* The best source address, which we don't need. */
-                   &ignored) != NO_ERROR
+  if(!ares_fpGetBestRoute2 ||
+     ares_fpGetBestRoute2(/* The interface to use.  The index is ignored since we are
+                           * passing a LUID.
+                           */
+                           luid, 0,
+                           /* No specific source address. */
+                           NULL,
+                           /* Our destination address. */
+                           dest,
+                           /* No options. */
+                           0,
+                           /* The route row. */
+                           &row,
+                           /* The best source address, which we don't need. */
+                           &ignored) != NO_ERROR
      /* If the metric is "unused" (-1) or too large for us to add the two
       * metrics, use the worst possible, thus sorting this last.
       */
@@ -788,7 +1118,7 @@ static ULONG getBestRouteMetric(IF_LUID * const luid, /* Can't be const :( */
 }
 
 /*
- * get_DNS_Windows()
+ * get_DNS_AdaptersAddresses()
  *
  * Locates DNS info using GetAdaptersAddresses() function from the Internet
  * Protocol Helper (IP Helper) API. When located, this returns a pointer
@@ -803,10 +1133,10 @@ static ULONG getBestRouteMetric(IF_LUID * const luid, /* Can't be const :( */
  */
 #define IPAA_INITIAL_BUF_SZ 15 * 1024
 #define IPAA_MAX_TRIES 3
-static int get_DNS_Windows(char **outptr)
+static int get_DNS_AdaptersAddresses(char **outptr)
 {
   IP_ADAPTER_DNS_SERVER_ADDRESS *ipaDNSAddr;
-  IP_ADAPTER_ADDRESSES *ipaa, *newipaa, *ipaaEntry;
+  IP_ADAPTER_ADDRESSES_LH *ipaa, *newipaa, *ipaaEntry;
   ULONG ReqBufsz = IPAA_INITIAL_BUF_SZ;
   ULONG Bufsz = IPAA_INITIAL_BUF_SZ;
   ULONG AddrFlags = 0;
@@ -828,6 +1158,10 @@ static int get_DNS_Windows(char **outptr)
 
   *outptr = NULL;
 
+  /* Verify run-time availability of GetAdaptersAddresses() */
+  if (ares_fpGetAdaptersAddresses == ZERO_NULL)
+    return 0;
+
   ipaa = ares_malloc(Bufsz);
   if (!ipaa)
     return 0;
@@ -844,7 +1178,8 @@ static int get_DNS_Windows(char **outptr)
   }
 
   /* Usually this call suceeds with initial buffer size */
-  res = GetAdaptersAddresses(AF_UNSPEC, AddrFlags, NULL, ipaa, &ReqBufsz);
+  res = (*ares_fpGetAdaptersAddresses) (AF_UNSPEC, AddrFlags, NULL,
+                                        ipaa, &ReqBufsz);
   if ((res != ERROR_BUFFER_OVERFLOW) && (res != ERROR_SUCCESS))
     goto done;
 
@@ -858,7 +1193,8 @@ static int get_DNS_Windows(char **outptr)
       Bufsz = ReqBufsz;
       ipaa = newipaa;
     }
-    res = GetAdaptersAddresses(AF_UNSPEC, AddrFlags, NULL, ipaa, &ReqBufsz);
+    res = (*ares_fpGetAdaptersAddresses) (AF_UNSPEC, AddrFlags, NULL,
+                                          ipaa, &ReqBufsz);
     if (res == ERROR_SUCCESS)
       break;
   }
@@ -900,17 +1236,26 @@ static int get_DNS_Windows(char **outptr)
           addressesSize = newSize;
         }
 
-        addresses[addressesIndex].metric =
-          getBestRouteMetric(&ipaaEntry->Luid,
-                             (SOCKADDR_INET*)(namesrvr.sa),
-                             ipaaEntry->Ipv4Metric);
+        /* Vista required for Luid or Ipv4Metric */
+        if (ares_IsWindowsVistaOrGreater())
+        {
+          /* Save the address as the next element in addresses. */
+          addresses[addressesIndex].metric =
+            getBestRouteMetric(&ipaaEntry->Luid,
+                               (SOCKADDR_INET*)(namesrvr.sa),
+                               ipaaEntry->Ipv4Metric);
+        }
+        else
+        {
+          addresses[addressesIndex].metric = (ULONG)-1;
+        }
 
         /* Record insertion index to make qsort stable */
         addresses[addressesIndex].orig_idx = addressesIndex;
 
-        if (!ares_inet_ntop(AF_INET, &namesrvr.sa4->sin_addr,
-                            addresses[addressesIndex].text,
-                            sizeof(addresses[0].text))) {
+        if (! ares_inet_ntop(AF_INET, &namesrvr.sa4->sin_addr,
+                             addresses[addressesIndex].text,
+                             sizeof(addresses[0].text))) {
           continue;
         }
         ++addressesIndex;
@@ -933,17 +1278,26 @@ static int get_DNS_Windows(char **outptr)
           addressesSize = newSize;
         }
 
-        addresses[addressesIndex].metric =
-          getBestRouteMetric(&ipaaEntry->Luid,
-                             (SOCKADDR_INET*)(namesrvr.sa),
-                             ipaaEntry->Ipv6Metric);
+        /* Vista required for Luid or Ipv4Metric */
+        if (ares_IsWindowsVistaOrGreater())
+        {
+          /* Save the address as the next element in addresses. */
+          addresses[addressesIndex].metric =
+            getBestRouteMetric(&ipaaEntry->Luid,
+                               (SOCKADDR_INET*)(namesrvr.sa),
+                               ipaaEntry->Ipv6Metric);
+        }
+        else
+        {
+          addresses[addressesIndex].metric = (ULONG)-1;
+        }
 
         /* Record insertion index to make qsort stable */
         addresses[addressesIndex].orig_idx = addressesIndex;
 
-        if (!ares_inet_ntop(AF_INET6, &namesrvr.sa6->sin6_addr,
-                            addresses[addressesIndex].text,
-                            sizeof(addresses[0].text))) {
+        if (! ares_inet_ntop(AF_INET6, &namesrvr.sa6->sin6_addr,
+                             addresses[addressesIndex].text,
+                             sizeof(addresses[0].text))) {
           continue;
         }
         ++addressesIndex;
@@ -989,6 +1343,35 @@ done:
   }
 
   return 1;
+}
+
+/*
+ * get_DNS_Windows()
+ *
+ * Locates DNS info from Windows employing most suitable methods available at
+ * run-time no matter which Windows version it is. When located, this returns
+ * a pointer in *outptr to a newly allocated memory area holding a string with
+ * a space or comma seperated list of DNS IP addresses, null-terminated.
+ *
+ * Returns 0 and nullifies *outptr upon inability to return DNSes string.
+ *
+ * Returns 1 and sets *outptr when returning a dynamically allocated string.
+ *
+ * Implementation supports Windows 95 and newer.
+ */
+static int get_DNS_Windows(char **outptr)
+{
+  /* Try using IP helper API GetAdaptersAddresses(). IPv4 + IPv6, also sorts
+   * DNS servers by interface route metrics to try to use the best DNS server. */
+  if (get_DNS_AdaptersAddresses(outptr))
+    return 1;
+
+  /* Try using IP helper API GetNetworkParams(). IPv4 only. */
+  if (get_DNS_NetworkParams(outptr))
+    return 1;
+
+  /* Fall-back to registry information */
+  return get_DNS_Registry(outptr);
 }
 
 /*
