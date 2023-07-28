@@ -18,6 +18,11 @@
 #include "ares_setup.h"
 #include "ares_strcasecmp.h"
 
+#ifdef _WIN32
+#define strcmpi _strcmpi
+#define stricmp _stricmp
+#endif
+
 #ifndef HAVE_STRCASECMP
 int ares_strcasecmp(const char *a, const char *b)
 {
