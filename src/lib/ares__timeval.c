@@ -26,7 +26,12 @@ struct timeval ares__tvnow(void)
   ** increases monotonically and wraps once 49.7 days have elapsed.
   */
   struct timeval now;
+  /* cherry-picked from 1.30 from commit 1dff8f6 */
+#if defined(_WIN32) && defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
+  ULONGLONG milliseconds = GetTickCount64();
+#else
   DWORD milliseconds = GetTickCount();
+#endif
   now.tv_sec = milliseconds / 1000;
   now.tv_usec = (milliseconds % 1000) * 1000;
   return now;
